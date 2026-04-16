@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# CDK
+cicd-cdk/cdk.out/
+cicd-cdk/dist/
+cicd-cdk/cdk.context.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
