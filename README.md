@@ -1,55 +1,67 @@
-# Python Version Upgrade using AWS Transform custom
+# Python Version Upgrade using AWS Transform continuous modernization and CI/CD
 
-Automate Python 3.8/3.9 → 3.11/3.12/3.13/3.14 upgrades using AWS Transform custom (`atx`) with a CI/CD pipeline built on CodePipeline, CodeBuild, and CodeDeploy.
+Automate Python 3.8/3.9/3.10 → 3.11/3.12/3.13 upgrades using AWS Transform continuous modernization (CM), then test and ship the result with a CI/CD pipeline built on CodePipeline, CodeBuild, and CodeDeploy.
+
+CM finds the outdated code and opens a remediation pull request on GitHub. This sample adds what CM doesn't cover: CI on that pull request, and a canary deployment to AWS Lambda once it merges.
 
 ## Architecture
 
-![Architecture Diagram](images/ATX_arch_diag.png)
+![Architecture Diagram](images/CM_arch_diag.png)
+
+The diagram source is [`images/CM_arch_diag.drawio`](images/CM_arch_diag.drawio).
 
 ### Architecture Flow
 
-**1. Developers Push Code Changes**
-Developers push their Python source code (e.g. Python 3.8/3.9) to the pipeline. This is the entry point — a `git push` to the `main` branch of the CodeCommit repository triggers the entire CI/CD flow automatically.
+**1. Developers analyze and remediate with AWS Transform (CM)**
+Developers drive CM from the `atx ct` CLI. A GitHub organization (or user) is added as a CM source with `atx ct source add`, and `atx ct discovery scan` enumerates its repositories. `atx ct analysis run` then scans the repository and records findings, such as code and dependencies that block a move to a newer Python version. Findings carry a severity and, when auto-fixable, the transformation that fixes them.
 
-**2. AWS CodeCommit**
-The source code lands in a CodeCommit repository (`atx-python-upgrade-source`). CodePipeline is configured to watch the `main` branch, so any new commit kicks off a new pipeline execution. The source code is packaged as a pipeline artifact and passed to the next stage.
+**2. CM opens a pull request on GitHub**
+`atx ct remediation create` applies the AWS managed transformation `AWS/python-version-upgrade`. It upgrades syntax and dependencies, validates the result against the target Python version, pushes a branch, and opens a pull request on GitHub.
 
-**3. AWS CodeBuild (ATX Transform)**
-This is the core transformation stage. CodeBuild spins up a container that includes the ATX CLI image. The build process:
-- Downloads the transformation definition from **Amazon S3 (Output)** bucket (`definitions/transformation_definition.md`).
-- Publishes the definition to the ATX registry using `atx custom def publish`.
-- Initializes a local git repo in the source directory (required by ATX).
-- Executes the transformation with `atx custom def exec`, which analyzes the codebase, identifies Python version-specific changes, upgrades syntax, updates dependencies, and validates the result against the target Python version.
-- Archives the transformed code as a zip to **Amazon S3 (Output)** under `results/transformed.zip`.
-- Pipeline artifacts (the transformed source) are stored in **Amazon S3 (Artifacts)** for the next stage.
+**3. AWS CodePipeline: pull request CI (`cm-python-upgrade-pr-ci`)**
+The pipeline is connected to GitHub through AWS CodeConnections and triggers when a pull request targeting `main` is opened or updated. The **Test** stage (CodeBuild) creates a virtual environment on the target Python version, installs `requirements.txt`, compiles every source file, and runs `pytest` when tests are present.
 
-**4. Amazon SNS (Manual Approval)**
-The pipeline pauses and sends a notification via an SNS topic (`atx-pipeline-approval`). If an approval email was configured during deployment, the reviewer receives an email with a link to review the transformation results. The reviewer can inspect the ATX-transformed code (e.g. via the S3 output or CodeBuild logs) and either approve to continue deployment or reject to stop the pipeline. This human gate ensures no unreviewed code reaches production.
+**4. Review and merge to `main`**
+A reviewer inspects the CM diff and the CI result, then merges. The pull request review is the human gate before deployment; there is no separate pipeline approval. The merge (a push to `main`) triggers the deploy pipeline (`cm-python-upgrade-pipeline`), whose **Test** stage re-runs the same checks on the merged code. Pipeline artifacts are stored in **Amazon S3 (Artifacts)**.
 
 **5. AWS CodeBuild (Package)**
-Once approved, this stage prepares the transformed code for Lambda deployment. CodeBuild:
-- Installs Python dependencies from `requirements.txt` into the project directory.
-- Creates a deployment zip (`lambda-package.zip`), excluding `.git`, `__pycache__`, and `.pyc` files.
-- Updates the Lambda function code using `aws lambda update-function-code`.
-- Upgrades the Lambda runtime to the target version (e.g. `python3.14`) using `aws lambda update-function-configuration`.
-- Publishes a new Lambda version and retrieves the current alias version.
-- Generates an `appspec.json` for CodeDeploy, mapping the current version and the new target version for the `live` alias.
-- Archives the deployed artifact to **Amazon S3 (Output)** under `deployed/` with a timestamped filename.
+Package installs dependencies, builds `lambda-package.zip`, updates the Lambda function code, upgrades the runtime to the target version (e.g. `python3.13`), publishes a new version, writes an `appspec.json` for the `live` alias, and archives the package to **Amazon S3 (Output)** under `deployed/`.
 
 **6. AWS CodeDeploy (Canary 10%/5min)**
-CodeDeploy takes the `appspec.json` from the Package stage and begins a canary deployment on the Lambda `live` alias using the `CANARY_10PERCENT_5MINUTES` strategy. During the canary window, 90% of traffic continues to go to the **Original Version (Python 3.8/3.9)** while 10% is shifted to the new version. A **CloudWatch Error Alarm** (`atx-python-app-errors`) monitors the Lambda alias for invocation errors (threshold: ≥1 error in a 1-minute period). If the alarm triggers during the canary window, CodeDeploy automatically rolls back to the previous version — both on alarm and on failed deployment.
+CodeDeploy shifts the `live` alias with `CANARY_10PERCENT_5MINUTES`. A **CloudWatch Error Alarm** (`cm-python-app-errors`, ≥1 error in 1 minute) triggers automatic rollback, as does a failed deployment.
 
-**7. New Version (Python 3.11/3.12/3.13/3.14)**
-During the 5-minute canary period, 10% of traffic is routed to the newly deployed Lambda version running the upgraded Python code. If no errors are detected by CloudWatch during this window, CodeDeploy completes the deployment and shifts 100% of traffic to the new version. The Lambda function is now fully running on the target Python runtime with the ATX-transformed code.
+**7. Older Version**
+During the 5-minute canary, 90% of traffic stays on the previous Lambda version.
+
+**8. New Version (Python 3.11/3.12/3.13)**
+10% of traffic goes to the new version running the CM-remediated code on the target runtime. If no errors are detected during the canary, CodeDeploy shifts 100% of traffic to it.
 
 ## Prerequisites
 
 - AWS CLI installed and configured (`aws configure`)
-- Node.js 18+ and npm
+- Node.js 22+ and npm
 - AWS CDK CLI (`npm install -g aws-cdk`)
 - Git installed
+- AWS Transform CLI: `curl -fsSL https://transform-cli.awsstatic.com/install.sh | bash`
+- The AWS managed policy `AWSTransformCustomFullAccess` attached to the IAM user or role running `atx`
+- A GitHub repository and a personal access token (classic) with the `repo` scope. CM uses it to read the repository, push the remediation branch, and open the pull request.
 
-## Step 1: Deploy the CDK Stack
+## Step 1: Push the Sample App to GitHub
+
+Create an empty GitHub repository (e.g. `todo-manager`), then push the contents of `todo_manager/` to its root:
+
+```bash
+cd todo_manager
+git init
+git add .
+git commit -m "initial commit"
+git branch -M main
+git remote add origin https://github.com/<owner>/todo-manager.git
+git push -u origin main
+cd ..
+```
+
+## Step 2: Deploy the CDK Stack
 
 ```bash
 cd cicd-cdk
@@ -62,124 +74,147 @@ Bootstrap CDK (first time per account/region):
 npx cdk bootstrap aws://$(aws sts get-caller-identity --query Account --output text)/${AWS_REGION:-us-east-1}
 ```
 
-Deploy (optionally pass your email for approval notifications):
-
-```bash
-npx cdk deploy --context approvalEmail=you@example.com
-```
-
-Customize source and target Python versions (defaults to 3.9 → 3.14):
+Deploy, pointing the pipelines at your repository:
 
 ```bash
 npx cdk deploy \
-  --context approvalEmail=you@example.com \
-  --context sourcePythonVersion=3.8 \
-  --context targetPythonVersion=3.13
+  --context githubOwner=<owner> \
+  --context githubRepo=todo-manager
 ```
 
-Supported versions:
-- **Source**: `3.8`, `3.9`
-- **Target**: `3.11`, `3.12`, `3.13`, `3.14`
+Optional context values:
+
+| Context | Default | Description |
+|---|---|---|
+| `githubBranch` | `main` | Branch that PRs target and that deploys on push |
+| `connectionArn` | _(created)_ | Reuse an existing, already-activated CodeConnections connection |
+| `sourcePythonVersion` | `3.9` | Initial Lambda runtime: `3.8`, `3.9`, or `3.10` |
+| `targetPythonVersion` | `3.13` | Target runtime: `3.11`, `3.12`, or `3.13` |
+
+The supported versions match the range of `AWS/python-version-upgrade`.
 
 Or use the included script:
 
 ```bash
 chmod +x deploy.sh
-./deploy.sh
+GITHUB_OWNER=<owner> GITHUB_REPO=todo-manager ./deploy.sh
 ```
 
-Note the `RepositoryCloneUrl` from the stack outputs.
+## Step 3: Activate the GitHub Connection
 
-## Step 2: Configure Git for CodeCommit
+If the stack created the connection, it starts in **Pending** state. Open the AWS Console → **Developer Tools** → **Settings** → **Connections**, select `cm-python-upgrade-github`, choose **Update pending connection**, and authorize access to the repository. This is a one-time step. Pipeline runs fail at Source until it's done.
+
+## Step 4: Connect CM to GitHub
+
+Add the GitHub organization (or user) as a CM source. `read -s` reads the token without echoing it or saving it to shell history:
 
 ```bash
-git config --global credential.helper '!aws codecommit credential-helper $@'
-git config --global credential.UseHttpPath true
+read -s TOKEN && atx ct source add --name my-github --provider github --org <owner> --token "$TOKEN"; unset TOKEN
+atx ct discovery scan --source my-github
+atx ct repository list --source my-github
 ```
 
-## Step 3: Push Code to CodeCommit
+## Step 5: Analyze with CM
 
 ```bash
-cd todo_manager
-git init
-git add .
-git commit -m "initial commit"
-git branch -M main
-git remote add origin <RepositoryCloneUrl from stack output>
-git push -u origin main
+atx ct analysis run --type tech-debt-comprehensive --source my-github --repo my-github::todo-manager
+atx ct analysis get --id <analysis-id>
+atx ct findings list --analysis-id <analysis-id> --json
 ```
 
-This triggers the pipeline automatically.
+`analysis run` prints the analysis ID. Poll `analysis get` until the status is `complete`, then list its findings.
 
-## Step 4: Monitor the Pipeline
+`rapid-techdebt-analysis` is a faster option, but it only inspects package manifests. The sample's `requirements.txt` has no dependencies, so it can come back with zero findings even though the code targets an old Python version.
 
-Via CLI:
+## Step 6: Remediate with CM
+
+From findings (each finding uses its own fix transformation):
+
+```bash
+atx ct remediation create --ids <finding-id1,finding-id2> --name "python-3.13-upgrade"
+```
+
+Or run the AWS managed transformation directly against the repository:
+
+```bash
+atx ct remediation create \
+  --transformation-name AWS/python-version-upgrade \
+  --repo my-github::todo-manager \
+  -g "additionalPlanContext=The target Python version to upgrade to is Python 3.13"
+```
+
+Check the result and get the pull request link:
+
+```bash
+atx ct remediation list
+atx ct remediation status --id <remediation-id>
+```
+
+Poll `remediation status` until the repository shows the pull request link.
+
+## Step 7: CI on the Pull Request
+
+Opening the PR triggers `cm-python-upgrade-pr-ci` automatically:
 
 ```bash
 aws codepipeline get-pipeline-state \
-  --name atx-python-upgrade-pipeline \
+  --name cm-python-upgrade-pr-ci \
   --query 'stageStates[].{Stage:stageName,Status:latestExecution.status}' \
   --output table
 ```
 
-Or open the AWS Console → **CodePipeline** → `atx-python-upgrade-pipeline`.
+## Step 8: Review, Merge, and Deploy
 
-The pipeline will pause at **Manual_Approve**. Review the ATX transformation results and approve to continue deployment.
-
-## Step 5: Review Results
-
-After the pipeline completes, check the deployed Lambda:
+Review the diff on GitHub and merge once CI passes. The merge triggers `cm-python-upgrade-pipeline`:
 
 ```bash
-aws lambda get-function-configuration --function-name atx-python-app \
+aws codepipeline get-pipeline-state \
+  --name cm-python-upgrade-pipeline \
+  --query 'stageStates[].{Stage:stageName,Status:latestExecution.status}' \
+  --output table
+```
+
+## Step 9: Review Results
+
+```bash
+aws lambda get-function-configuration --function-name cm-python-app \
   --query '{Runtime:Runtime,Version:Environment.Variables.PYTHON_VERSION}' \
   --output table
 ```
 
-Transformed code is also archived in S3:
+Deployed packages are archived in S3:
 
 ```bash
-aws s3 ls s3://atx-output-$(aws sts get-caller-identity --query Account --output text)-${AWS_REGION:-us-east-1}/results/
+aws s3 ls s3://cm-output-$(aws sts get-caller-identity --query Account --output text)-${AWS_REGION:-us-east-1}/deployed/
 ```
 
-## Alternative: Run ATX Locally (No Pipeline)
+## Scaling with CM
 
-```bash
-# Init git in the project (required by atx)
-cd todo_manager
-git init && git add . && git commit -m "initial"
-cd ..
+The steps above target one repository, but the CM side works the same across a portfolio:
 
-# Publish the definition
-atx custom def publish \
-  -n "python-version-upgrade-314" \
-  --description "Python 3.9 to 3.14 upgrade" \
-  --sd ./python-314-def
+- **Whole organizations:** one GitHub source covers every repository in the organization; `discovery scan` enumerates them.
+- **Migration waves:** label repositories (e.g. `atx ct repository update --source my-github --repo "my-github::svc-a,my-github::svc-b" --labels "wave:1"`) and filter with `atx ct repository list --labels "wave:1"`.
+- **Portfolio-wide analysis and remediation:** run an analysis across a source, then remediate findings in bulk. Each analysis or remediation request covers at most 100 repositories; split larger scopes into batches.
+- **Continuous monitoring:** schedule recurring analyses (daily, weekly, or monthly) with `atx ct schedule`, which uses Amazon EventBridge Scheduler.
+- **Remote compute:** analyses can run on AWS Transform-managed infrastructure with nothing to provision (`atx ct remote analysis --mode aws-managed`). Remediation runs locally or on an AWS Batch (Fargate) or Amazon EC2 stack provisioned in your account with `atx ct remote` commands.
 
-# Run non-interactively
-atx custom def exec \
-  -n "python-version-upgrade-314" \
-  -p ./todo_manager \
-  -c "python3 main.py" \
-  -x -t \
-  --configuration 'additionalPlanContext=The target Python version to upgrade to is Python 3.14'
+Each remediated repository opens its own pull request. Deploy this stack once per repository (or adapt it) to get CI and canary deployment for each one.
 
-# Check results
-cd todo_manager && git diff
-```
+See the [AWS Transform continuous modernization documentation](https://docs.aws.amazon.com/transform/latest/userguide/continuous-modernization.html) for details.
 
 ## Project Structure
 
 ```
-transform-custom-using-cicd/
-├── cicd-cdk/                        # CDK stack (pipeline infrastructure)
+sample-transform-custom-using-cicd/
+├── cicd-cdk/                        # CDK stack (CI/CD infrastructure)
 │   ├── bin/app.ts                   # CDK app entry point
-│   ├── lib/pipeline-stack.ts        # Pipeline stack definition
+│   ├── lib/pipeline-stack.ts        # PR CI pipeline + deploy pipeline
 │   ├── deploy.sh                    # One-click deploy script
 │   ├── package.json
 │   └── tsconfig.json
-├── python-314-def/                  # ATX transformation definition
-│   └── transformation_definition.md
+├── images/
+│   ├── CM_arch_diag.png             # Architecture diagram
+│   └── CM_arch_diag.drawio          # Editable diagram source
 ├── todo_manager/                    # Sample Python 3.9 app (source code)
 │   ├── main.py
 │   ├── models.py
@@ -191,29 +226,36 @@ transform-custom-using-cicd/
 
 ## Notes
 
-- The pipeline makes local git commits only inside CodeBuild. It does not push back to CodeCommit.
-- The Lambda starts at Python 3.9 intentionally — the pipeline upgrades both code and runtime.
+- CM runs from the `atx` CLI, outside this stack. The stack contains no CM infrastructure and no AWS Transform permissions.
+- CI results show in CodePipeline; they are not posted back to the GitHub pull request as a status check. Protect `main` on GitHub (require a pull request review) so changes reach the deploy pipeline only through a reviewed merge.
+- Any push to `main` deploys, including changes that didn't come from CM. The Test stage runs on the target Python version, so code that isn't yet compatible stops before Package.
+- The Lambda starts at the source Python version intentionally; the Package stage upgrades the runtime to the target version.
 - CodeDeploy uses `CANARY_10PERCENT_5MINUTES` with auto-rollback on CloudWatch alarms.
 - All S3 buckets enforce SSL and are encrypted with a KMS key (with rotation enabled).
-- Resume an interrupted ATX session: `atx --resume` or `atx --conversation-id <id>`
-- ATX logs: `~/.aws/atx/custom/<conversation_id>/logs/`
 
 ## Cleanup
 
 ```bash
 cd cicd-cdk
-npx cdk destroy
+npx cdk destroy --context githubOwner=<owner> --context githubRepo=todo-manager
+atx ct source remove --name my-github
 ```
 
-## ATX CLI Quick Reference
+Delete the remediation branches and the GitHub repository if you no longer need them.
+
+## CM CLI Quick Reference
 
 | Command | Description |
 |---|---|
-| `atx custom def list` | List all transformation definitions |
-| `atx custom def publish -n <name> --sd <dir>` | Publish a definition to the registry |
-| `atx custom def save-draft -n <name> --sd <dir>` | Save as draft (30-day expiry) |
-| `atx custom def exec -n <name> -p <path>` | Execute a transformation |
-| `atx custom def get -n <name>` | Get details of a definition |
-| `atx custom def delete -n <name>` | Delete a definition |
-| `atx --resume` | Resume most recent session |
-| `atx update` | Update atx CLI |
+| `atx ct source add --name <n> --provider github --org <org> --token <t>` | Connect a GitHub organization or user |
+| `atx ct discovery scan --source <n>` | Discover repositories in a source |
+| `atx ct repository list --source <n>` | List discovered repositories |
+| `atx ct analysis run --type <type> --source <n> [--repo <n>::<repo>]` | Run an analysis |
+| `atx ct analysis get --id <id>` | Check an analysis's status |
+| `atx ct analysis list --json` | List analyses |
+| `atx ct findings list --json` | List findings |
+| `atx ct remediation create --ids <ids> --name <name>` | Remediate findings (opens PRs) |
+| `atx ct remediation create --transformation-name <td> --repo <n>::<repo>` | Run a transformation directly on a repository |
+| `atx ct remediation status --id <id>` | Check remediation status and PR links |
+| `atx ct remediation retry --id <id>` | Retry a failed remediation |
+| `atx custom def list` | List available transformation definitions |

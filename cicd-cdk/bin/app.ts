@@ -2,11 +2,11 @@
 import * as cdk from "aws-cdk-lib";
 import { Aspects } from "aws-cdk-lib";
 import { AwsSolutionsChecks } from "cdk-nag";
-import { AtxPipelineStack } from "../lib/pipeline-stack";
+import { CmPipelineStack } from "../lib/pipeline-stack";
 
 const app = new cdk.App();
 
-new AtxPipelineStack(app, "AtxPythonUpgradePipeline", {
+new CmPipelineStack(app, "CmPythonUpgradePipeline", {
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION || "us-east-1",

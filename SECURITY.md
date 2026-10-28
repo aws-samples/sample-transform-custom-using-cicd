@@ -10,13 +10,13 @@ This project is designed as a blog/demo reference implementation. The following 
 
 ### Accepted Security Debt
 
-#### 1. `transform-custom:ConverseStream/Converse` with `Resource: "*"`
+#### 1. GitHub personal access token used by AWS Transform continuous modernization
 
-The ATX streaming APIs (`ConverseStream`, `Converse`) do not support resource-level permissions. `Resource: "*"` is required for these actions to function. This is an AWS service limitation, not a misconfiguration.
+CM authenticates to GitHub with a personal access token (classic, `repo` scope) supplied to `atx ct source add`. The token can read and write every repository the owning account can access. Prefer a token from a dedicated machine user limited to the target repositories, keep its expiry short, and never paste it into chat, scripts, or shell history (the README uses `read -s`). The CDK stack itself never handles this token; the pipelines reach GitHub through an AWS CodeConnections connection.
 
-#### 2. `transform-custom:*` wildcard scoped to account/region ARN
+#### 2. CI results are not enforced as a GitHub status check
 
-The ATX CLI calls multiple internal APIs during `publish`, `exec`, and status polling. The full API surface is not publicly documented, so specific action enumeration risks breaking the transform when the API evolves. The wildcard is scoped to `arn:aws:transform-custom:<region>:<account>:*`, limiting access to the deploying account and region only.
+The pull request pipeline reports results in CodePipeline only. Configure branch protection on the tracked branch (required pull request review) so only reviewed merges reach the deploy pipeline.
 
 #### 3. Lambda environment variables and CloudWatch Logs using default encryption
 
@@ -29,9 +29,10 @@ The convenience deploy script skips CDK deployment approval prompts. This is int
 ### Security Controls in Place
 
 - All S3 buckets enforce SSL (`enforceSSL: true`) and are encrypted with a KMS key with rotation enabled
-- SNS topic is KMS-encrypted with a resource policy denying non-SSL publishes
 - CodeBuild artifacts are encrypted with the shared KMS key
 - IAM policies are scoped to specific resource ARNs wherever possible
 - `cdk-nag` (`AwsSolutionsChecks`) runs at synth time to catch security issues
-- Pipeline includes a manual approval gate before deploying transformed code
+- GitHub access from the pipelines uses AWS CodeConnections; no Git credentials are stored in the stack
+- CM-remediated code reaches deployment only through a GitHub pull request, which is the human review gate
+- Every change is tested on the target Python version before packaging
 - CodeDeploy uses canary deployment with CloudWatch alarm-based auto-rollback

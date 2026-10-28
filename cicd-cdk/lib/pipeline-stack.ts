@@ -4,33 +4,48 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as kms from "aws-cdk-lib/aws-kms";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as codedeploy from "aws-cdk-lib/aws-codedeploy";
-import * as codecommit from "aws-cdk-lib/aws-codecommit";
 import * as codebuild from "aws-cdk-lib/aws-codebuild";
 import * as codepipeline from "aws-cdk-lib/aws-codepipeline";
 import * as codepipeline_actions from "aws-cdk-lib/aws-codepipeline-actions";
-import * as sns from "aws-cdk-lib/aws-sns";
-import * as sns_subs from "aws-cdk-lib/aws-sns-subscriptions";
+import * as codestarconnections from "aws-cdk-lib/aws-codestarconnections";
 import * as logs from "aws-cdk-lib/aws-logs";
-import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import { NagSuppressions } from "cdk-nag";
 import { Construct } from "constructs";
 
-export class AtxPipelineStack extends cdk.Stack {
+/**
+ * CI/CD for code remediated by AWS Transform continuous modernization (CM).
+ *
+ * CM (driven from the `atx ct` CLI, outside this stack) analyzes the GitHub
+ * repository and opens a remediation pull request. This stack provides what
+ * CM does not: CI on that pull request and a canary deployment once it merges.
+ *
+ *   PR opened/updated -> PullRequestPipeline: Source -> Test
+ *   Push to branch    -> DeployPipeline:      Source -> Test -> Package -> Deploy (CodeDeploy canary)
+ */
+export class CmPipelineStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
     // ─── Context Parameters ───
-    const transformationName =
-      this.node.tryGetContext("transformationName") || "python-version-upgrade-314";
-    const approvalEmail = this.node.tryGetContext("approvalEmail") || "";
-    const sourcePythonVersion = this.node.tryGetContext("sourcePythonVersion") || "3.9";
-    const targetPythonVersion = this.node.tryGetContext("targetPythonVersion") || "3.14";
+    const githubOwner: string = this.node.tryGetContext("githubOwner") || "";
+    const githubRepo: string = this.node.tryGetContext("githubRepo") || "";
+    const githubBranch: string = this.node.tryGetContext("githubBranch") || "main";
+    const existingConnectionArn: string = this.node.tryGetContext("connectionArn") || "";
+    const sourcePythonVersion: string = this.node.tryGetContext("sourcePythonVersion") || "3.9";
+    const targetPythonVersion: string = this.node.tryGetContext("targetPythonVersion") || "3.13";
     const targetRuntime = `python${targetPythonVersion}`;
 
-    // Validate supported version combinations
-    const validSourceVersions = ["3.8", "3.9"];
-    const validTargetVersions = ["3.11", "3.12", "3.13", "3.14"];
+    if (!githubOwner || !githubRepo) {
+      throw new Error(
+        "githubOwner and githubRepo context values are required, e.g. " +
+          "--context githubOwner=my-org --context githubRepo=todo-manager"
+      );
+    }
+
+    // Supported range of the AWS managed transformation AWS/python-version-upgrade
+    const validSourceVersions = ["3.8", "3.9", "3.10"];
+    const validTargetVersions = ["3.11", "3.12", "3.13"];
     if (!validSourceVersions.includes(sourcePythonVersion)) {
       throw new Error(`sourcePythonVersion must be one of ${validSourceVersions.join(", ")}. Got: ${sourcePythonVersion}`);
     }
@@ -38,28 +53,36 @@ export class AtxPipelineStack extends cdk.Stack {
       throw new Error(`targetPythonVersion must be one of ${validTargetVersions.join(", ")}. Got: ${targetPythonVersion}`);
     }
 
-    // Map version string to CDK Lambda Runtime
     const runtimeMap: Record<string, lambda.Runtime> = {
       "3.8": lambda.Runtime.PYTHON_3_8,
       "3.9": lambda.Runtime.PYTHON_3_9,
       "3.10": lambda.Runtime.PYTHON_3_10,
-      "3.11": lambda.Runtime.PYTHON_3_11,
-      "3.12": lambda.Runtime.PYTHON_3_12,
-      "3.13": lambda.Runtime.PYTHON_3_13,
     };
-    const sourceRuntime = runtimeMap[sourcePythonVersion] || lambda.Runtime.PYTHON_3_9;
+    const sourceRuntime = runtimeMap[sourcePythonVersion];
+
+    // ─── GitHub connection (AWS CodeConnections) ───
+    // A connection created here starts in PENDING state and must be activated
+    // once in the console (Developer Tools → Settings → Connections).
+    let connectionArn = existingConnectionArn;
+    if (!connectionArn) {
+      const connection = new codestarconnections.CfnConnection(this, "GitHubConnection", {
+        connectionName: "cm-python-upgrade-github",
+        providerType: "GitHub",
+      });
+      connectionArn = connection.attrConnectionArn;
+    }
 
     // ─── KMS Key for encryption ───
     const encryptionKey = new kms.Key(this, "PipelineKey", {
-      alias: "atx-pipeline-key",
+      alias: "cm-pipeline-key",
       enableKeyRotation: true,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
-      description: "KMS key for ATX pipeline encryption (CodeBuild, S3, SNS)",
+      description: "KMS key for the CM CI/CD pipeline (CodeBuild, S3)",
     });
 
     // ─── S3 Buckets ───
     const accessLogsBucket = new s3.Bucket(this, "AccessLogsBucket", {
-      bucketName: `atx-access-logs-${this.account}-${this.region}`,
+      bucketName: `cm-access-logs-${this.account}-${this.region}`,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       enforceSSL: true,
@@ -68,7 +91,7 @@ export class AtxPipelineStack extends cdk.Stack {
     });
 
     const artifactBucket = new s3.Bucket(this, "ArtifactBucket", {
-      bucketName: `atx-pipeline-artifacts-${this.account}-${this.region}`,
+      bucketName: `cm-pipeline-artifacts-${this.account}-${this.region}`,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       enforceSSL: true,
@@ -78,7 +101,7 @@ export class AtxPipelineStack extends cdk.Stack {
     });
 
     const outputBucket = new s3.Bucket(this, "OutputBucket", {
-      bucketName: `atx-output-${this.account}-${this.region}`,
+      bucketName: `cm-output-${this.account}-${this.region}`,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       enforceSSL: true,
@@ -87,28 +110,15 @@ export class AtxPipelineStack extends cdk.Stack {
       serverAccessLogsPrefix: "output-bucket/",
     });
 
-    // ─── Upload transformation definition to S3 ───
-    new s3deploy.BucketDeployment(this, "TransformDefDeployment", {
-      sources: [s3deploy.Source.asset("../python-314-def")],
-      destinationBucket: outputBucket,
-      destinationKeyPrefix: "definitions",
-    });
-
-    // ─── CodeCommit Repository ───
-    const repo = new codecommit.Repository(this, "SourceRepo", {
-      repositoryName: "atx-python-upgrade-source",
-      description: "Python project source code for ATX transformation",
-    });
-
     // ─── Lambda Function ───
     const lambdaLogGroup = new logs.LogGroup(this, "AppLogGroup", {
-      logGroupName: "/aws/lambda/atx-python-app",
+      logGroupName: "/aws/lambda/cm-python-app",
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       retention: logs.RetentionDays.TWO_WEEKS,
     });
 
     const appFunction = new lambda.Function(this, "AppFunction", {
-      functionName: "atx-python-app",
+      functionName: "cm-python-app",
       runtime: sourceRuntime,
       handler: "main.handler",
       code: lambda.Code.fromInline(
@@ -135,7 +145,7 @@ export class AtxPipelineStack extends cdk.Stack {
 
     // ─── CloudWatch Alarm for CodeDeploy rollback ───
     const errorAlarm = new cloudwatch.Alarm(this, "LambdaErrorAlarm", {
-      alarmName: "atx-python-app-errors",
+      alarmName: "cm-python-app-errors",
       metric: alias.metricErrors({
         period: cdk.Duration.minutes(1),
         statistic: "Sum",
@@ -160,90 +170,42 @@ export class AtxPipelineStack extends cdk.Stack {
     artifactBucket.grantRead(deploymentGroup.role);
     encryptionKey.grantDecrypt(deploymentGroup.role);
 
-    // ─── CodeBuild: ATX Transform Stage ───
-    const transformProject = new codebuild.PipelineProject(this, "TransformProject", {
-      projectName: "atx-transform",
+    // ─── CodeBuild: Test Stage (CI on the target Python version) ───
+    // Shared by the pull request pipeline and the deploy pipeline.
+    const testProject = new codebuild.PipelineProject(this, "TestProject", {
+      projectName: "cm-python-test",
       encryptionKey,
       environment: {
-        buildImage: codebuild.LinuxBuildImage.fromDockerRegistry(
-          "public.ecr.aws/b7y6j9m3/aws-transform-custom:latest"
-        ),
-        computeType: codebuild.ComputeType.MEDIUM,
-        privileged: false,
-      },
-      environmentVariables: {
-        TRANSFORMATION_NAME: { value: transformationName },
-        OUTPUT_BUCKET: { value: outputBucket.bucketName },
-        TRANSFORM_DEF_S3_KEY: { value: "definitions/transformation_definition.md" },
+        buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
+        computeType: codebuild.ComputeType.SMALL,
       },
       buildSpec: codebuild.BuildSpec.fromObject({
         version: "0.2",
         phases: {
-          pre_build: {
+          install: {
+            "runtime-versions": { python: targetPythonVersion },
             commands: [
-              "echo 'Downloading transformation definition from S3...'",
-              "aws s3 cp s3://$OUTPUT_BUCKET/$TRANSFORM_DEF_S3_KEY /tmp/transformation_definition.md",
-              "echo 'Publishing transformation definition to registry...'",
-              "mkdir -p /tmp/transform-def && cp /tmp/transformation_definition.md /tmp/transform-def/",
-              `atx custom def publish -n $TRANSFORMATION_NAME --sd /tmp/transform-def --description 'Python ${sourcePythonVersion} to ${targetPythonVersion} upgrade'`,
-              "echo 'Preparing source for ATX transformation...'",
-              "cd $CODEBUILD_SRC_DIR",
-              "git config --global user.email 'atx-pipeline@automated.com'",
-              "git config --global user.name 'ATX Pipeline'",
-              "if [ ! -d .git ]; then git init && git add . && git commit -m 'initial'; fi",
+              "python --version",
+              "python -m venv /tmp/venv",
+              "/tmp/venv/bin/pip install --upgrade pip",
+              "if [ -f requirements.txt ]; then /tmp/venv/bin/pip install -r requirements.txt; fi",
             ],
           },
           build: {
             commands: [
-              `atx custom def exec \\
-                -n $TRANSFORMATION_NAME \\
-                -p $CODEBUILD_SRC_DIR \\
-                -c noop \\
-                -x -t \\
-                --configuration 'additionalPlanContext=The target Python version to upgrade to is Python ${targetPythonVersion}'`,
+              "echo 'Compiling all sources on the target Python version...'",
+              "/tmp/venv/bin/python -m compileall -q -x '(^|/)(\\.git|\\.venv|venv)/' .",
+              "if ls test_*.py *_test.py tests 1>/dev/null 2>&1; then /tmp/venv/bin/pip install pytest && /tmp/venv/bin/python -m pytest; else echo 'No tests found, skipping pytest'; fi",
             ],
           },
-          post_build: {
-            commands: [
-              "echo 'Archiving transformed output to S3...'",
-              "cd $CODEBUILD_SRC_DIR",
-              "zip -r /tmp/transformed.zip .",
-              "aws s3 cp /tmp/transformed.zip s3://$OUTPUT_BUCKET/results/transformed.zip",
-            ],
-          },
-        },
-        artifacts: {
-          "base-directory": "$CODEBUILD_SRC_DIR",
-          files: ["**/*"],
         },
       }),
-      timeout: cdk.Duration.hours(2),
+      timeout: cdk.Duration.minutes(15),
     });
-
-    transformProject.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["transform-custom:*"],
-        resources: [
-          `arn:aws:transform-custom:${this.region}:${this.account}:*`,
-          `arn:aws:transform-custom:${this.region}:${this.account}:transformation/*`,
-        ],
-      })
-    );
-    // ConverseStream and other streaming APIs may require resource "*"
-    transformProject.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: [
-          "transform-custom:ConverseStream",
-          "transform-custom:Converse",
-        ],
-        resources: ["*"],
-      })
-    );
-    outputBucket.grantReadWrite(transformProject);
 
     // ─── CodeBuild: Package Stage (Package code & publish Lambda version) ───
     const packageProject = new codebuild.PipelineProject(this, "PackageProject", {
-      projectName: "atx-package-lambda",
+      projectName: "cm-package-lambda",
       encryptionKey,
       environment: {
         buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
@@ -259,7 +221,7 @@ export class AtxPipelineStack extends cdk.Stack {
         version: "0.2",
         phases: {
           install: {
-            "runtime-versions": { python: "3.12" },
+            "runtime-versions": { python: targetPythonVersion },
             commands: [
               "echo 'Packaging Lambda deployment...'",
               "if [ -f requirements.txt ]; then pip install -r requirements.txt -t .; fi",
@@ -273,7 +235,7 @@ export class AtxPipelineStack extends cdk.Stack {
               "aws lambda update-function-code --function-name $FUNCTION_NAME --zip-file fileb:///tmp/lambda-package.zip",
               "echo 'Waiting for code update to complete...'",
               "aws lambda wait function-updated --function-name $FUNCTION_NAME",
-              "echo 'Upgrading Lambda runtime to $TARGET_RUNTIME...'",
+              "echo \"Upgrading Lambda runtime to $TARGET_RUNTIME...\"",
               "aws lambda update-function-configuration --function-name $FUNCTION_NAME --runtime $TARGET_RUNTIME",
               "echo 'Waiting for configuration update to complete...'",
               "aws lambda wait function-updated --function-name $FUNCTION_NAME",
@@ -320,72 +282,79 @@ export class AtxPipelineStack extends cdk.Stack {
       })
     );
 
-    // ─── SNS Topic with SSL enforcement (AwsSolutions-SNS3) ───
-    const approvalTopic = new sns.Topic(this, "ApprovalTopic", {
-      topicName: "atx-pipeline-approval",
-      masterKey: encryptionKey,
+    // ─── Pipeline 1: CI on pull requests (e.g. CM remediation PRs) ───
+    const prSourceOutput = new codepipeline.Artifact("PrSourceOutput");
+    const prSourceAction = new codepipeline_actions.CodeStarConnectionsSourceAction({
+      actionName: "GitHub_Source",
+      connectionArn,
+      owner: githubOwner,
+      repo: githubRepo,
+      branch: githubBranch,
+      output: prSourceOutput,
     });
 
-    approvalTopic.addToResourcePolicy(
-      new iam.PolicyStatement({
-        sid: "EnforceSSLOnly",
-        effect: iam.Effect.DENY,
-        principals: [new iam.AnyPrincipal()],
-        actions: ["sns:Publish"],
-        resources: [approvalTopic.topicArn],
-        conditions: {
-          Bool: { "aws:SecureTransport": "false" },
+    const prPipeline = new codepipeline.Pipeline(this, "PullRequestPipeline", {
+      pipelineName: "cm-python-upgrade-pr-ci",
+      pipelineType: codepipeline.PipelineType.V2,
+      executionMode: codepipeline.ExecutionMode.PARALLEL,
+      artifactBucket,
+      stages: [
+        { stageName: "Source", actions: [prSourceAction] },
+        {
+          stageName: "Test",
+          actions: [
+            new codepipeline_actions.CodeBuildAction({
+              actionName: "Test_Target_Python",
+              project: testProject,
+              input: prSourceOutput,
+            }),
+          ],
         },
-      })
-    );
+      ],
+      triggers: [
+        {
+          providerType: codepipeline.ProviderType.CODE_STAR_SOURCE_CONNECTION,
+          gitConfiguration: {
+            sourceAction: prSourceAction,
+            pullRequestFilter: [
+              {
+                branchesIncludes: [githubBranch],
+                events: [
+                  codepipeline.GitPullRequestEvent.OPEN,
+                  codepipeline.GitPullRequestEvent.UPDATED,
+                ],
+              },
+            ],
+          },
+        },
+      ],
+    });
 
-    if (approvalEmail) {
-      approvalTopic.addSubscription(
-        new sns_subs.EmailSubscription(approvalEmail)
-      );
-    }
-
-    // ─── Pipeline Artifacts ───
+    // ─── Pipeline 2: Deploy on merge (push to the tracked branch) ───
     const sourceOutput = new codepipeline.Artifact("SourceOutput");
-    const transformOutput = new codepipeline.Artifact("TransformOutput");
     const packageOutput = new codepipeline.Artifact("PackageOutput");
+    const sourceAction = new codepipeline_actions.CodeStarConnectionsSourceAction({
+      actionName: "GitHub_Source",
+      connectionArn,
+      owner: githubOwner,
+      repo: githubRepo,
+      branch: githubBranch,
+      output: sourceOutput,
+    });
 
-    // ─── CodePipeline: Source → Transform → Approve → Package → Deploy ───
-    const pipeline = new codepipeline.Pipeline(this, "AtxPipeline", {
-      pipelineName: "atx-python-upgrade-pipeline",
+    const pipeline = new codepipeline.Pipeline(this, "DeployPipeline", {
+      pipelineName: "cm-python-upgrade-pipeline",
       pipelineType: codepipeline.PipelineType.V2,
       artifactBucket,
       stages: [
+        { stageName: "Source", actions: [sourceAction] },
         {
-          stageName: "Source",
-          actions: [
-            new codepipeline_actions.CodeCommitSourceAction({
-              actionName: "CodeCommit_Source",
-              repository: repo,
-              branch: "main",
-              output: sourceOutput,
-            }),
-          ],
-        },
-        {
-          stageName: "ATX_Transform",
+          stageName: "Test",
           actions: [
             new codepipeline_actions.CodeBuildAction({
-              actionName: "ATX_Transform",
-              project: transformProject,
+              actionName: "Test_Target_Python",
+              project: testProject,
               input: sourceOutput,
-              outputs: [transformOutput],
-            }),
-          ],
-        },
-        {
-          stageName: "Manual_Approve",
-          actions: [
-            new codepipeline_actions.ManualApprovalAction({
-              actionName: "Review_And_Approve",
-              notificationTopic: approvalTopic,
-              additionalInformation:
-                `Review the ATX Python ${sourcePythonVersion} → ${targetPythonVersion} transformation results before deploying to Lambda via CodeDeploy.`,
             }),
           ],
         },
@@ -395,7 +364,7 @@ export class AtxPipelineStack extends cdk.Stack {
             new codepipeline_actions.CodeBuildAction({
               actionName: "Package_Lambda",
               project: packageProject,
-              input: transformOutput,
+              input: sourceOutput,
               outputs: [packageOutput],
             }),
           ],
@@ -409,6 +378,15 @@ export class AtxPipelineStack extends cdk.Stack {
               input: packageOutput,
             }),
           ],
+        },
+      ],
+      triggers: [
+        {
+          providerType: codepipeline.ProviderType.CODE_STAR_SOURCE_CONNECTION,
+          gitConfiguration: {
+            sourceAction,
+            pushFilter: [{ branchesIncludes: [githubBranch] }],
+          },
         },
       ],
     });
@@ -443,87 +421,58 @@ export class AtxPipelineStack extends cdk.Stack {
       "CDK auto-generates report group ARN with -* suffix for CodeBuild projects. " +
       "This is scoped to the specific project report group.";
 
-    // Suppress AwsSolutions-IAM5 on CDK-generated roles
-    const rolePaths = [
-      "/AtxPythonUpgradePipeline/TransformProject/Role/DefaultPolicy/Resource",
-      "/AtxPythonUpgradePipeline/PackageProject/Role/DefaultPolicy/Resource",
-      "/AtxPythonUpgradePipeline/AtxPipeline/Role/DefaultPolicy/Resource",
-      "/AtxPythonUpgradePipeline/AtxPipeline/Source/CodeCommit_Source/CodePipelineActionRole/DefaultPolicy/Resource",
-      "/AtxPythonUpgradePipeline/AtxPipeline/Deploy/CodeDeploy_Canary/CodePipelineActionRole/DefaultPolicy/Resource",
-    ];
-
-    for (const path of rolePaths) {
-      NagSuppressions.addResourceSuppressionsByPath(this, path, [
-        {
-          id: "AwsSolutions-IAM5",
-          reason: s3WildcardReason,
-          appliesTo: cdkGeneratedS3Suppressions,
-        },
-        {
-          id: "AwsSolutions-IAM5",
-          reason:
-            "CDK KMS grant methods generate kms:ReEncrypt* and kms:GenerateDataKey* actions " +
-            "scoped to the specific KMS key ARN.",
-          appliesTo: cdkGeneratedKmsSuppressions,
-        },
-        {
-          id: "AwsSolutions-IAM5",
-          reason: bucketArnWildcardReason,
-          appliesTo: [
-            "Resource::<ArtifactBucket7410C9EF.Arn>/*",
-            "Resource::<OutputBucket7114EB27.Arn>/*",
-          ],
-        },
-        {
-          id: "AwsSolutions-IAM5",
-          reason: codebuildLogReason,
-          appliesTo: [
-            { regex: "/Resource::arn:<AWS::Partition>:logs:.*:log-group:/aws/codebuild/.*:\\*/g" } as any,
-          ],
-        },
-        {
-          id: "AwsSolutions-IAM5",
-          reason: codebuildReportReason,
-          appliesTo: [
-            { regex: "/Resource::arn:<AWS::Partition>:codebuild:.*:report-group/.*-\\*/g" } as any,
-          ],
-        },
-        {
-          id: "AwsSolutions-IAM5",
-          reason: "Resource::* required for service-level actions like ecr:GetAuthorizationToken or lambda:GetFunction.",
-          appliesTo: ["Resource::*"],
-        },
-      ]);
+    // Suppress AwsSolutions-IAM5 on CDK-generated roles of the projects and pipelines
+    for (const construct of [testProject, packageProject, prPipeline, pipeline]) {
+      NagSuppressions.addResourceSuppressions(
+        construct,
+        [
+          {
+            id: "AwsSolutions-IAM5",
+            reason: s3WildcardReason,
+            appliesTo: cdkGeneratedS3Suppressions,
+          },
+          {
+            id: "AwsSolutions-IAM5",
+            reason:
+              "CDK KMS grant methods generate kms:ReEncrypt* and kms:GenerateDataKey* actions " +
+              "scoped to the specific KMS key ARN.",
+            appliesTo: cdkGeneratedKmsSuppressions,
+          },
+          {
+            id: "AwsSolutions-IAM5",
+            reason: bucketArnWildcardReason,
+            appliesTo: [
+              "Resource::<ArtifactBucket7410C9EF.Arn>/*",
+              "Resource::<OutputBucket7114EB27.Arn>/*",
+            ],
+          },
+          {
+            id: "AwsSolutions-IAM5",
+            reason: codebuildLogReason,
+            appliesTo: [
+              { regex: "/Resource::arn:<AWS::Partition>:logs:.*:log-group:/aws/codebuild/.*:\\*/g" } as any,
+            ],
+          },
+          {
+            id: "AwsSolutions-IAM5",
+            reason: codebuildReportReason,
+            appliesTo: [
+              { regex: "/Resource::arn:<AWS::Partition>:codebuild:.*:report-group/.*-\\*/g" } as any,
+            ],
+          },
+          {
+            id: "AwsSolutions-IAM5",
+            reason: "Resource::* required for service-level actions like lambda:GetFunction.",
+            appliesTo: ["Resource::*"],
+          },
+        ],
+        true
+      );
     }
 
-    // Transform project: ATX transform-custom resource ARN wildcard
-    NagSuppressions.addResourceSuppressionsByPath(
-      this,
-      "/AtxPythonUpgradePipeline/TransformProject/Role/DefaultPolicy/Resource",
-      [
-        {
-          id: "AwsSolutions-IAM5",
-          reason:
-            "ATX transform-custom requires broad permissions for publish, exec, and related API calls. " +
-            "Wildcard scoped to arn:aws:transform-custom:<region>:<account>:*.",
-          appliesTo: [
-            `Resource::arn:aws:transform-custom:${this.region}:<AWS::AccountId>:*`,
-            { regex: "/Resource::arn:aws:transform-custom:.*:.*:\\*/g" } as any,
-            { regex: "/Resource::arn:aws:transform-custom:.*:.*:transformation/.*/g" } as any,
-          ],
-        },
-        {
-          id: "AwsSolutions-IAM5",
-          reason: "transform-custom:* actions needed for publish, exec, and status polling of transformation definitions.",
-          appliesTo: ["Action::transform-custom:*"],
-        },
-      ]
-    );
-
     // Package project: Lambda ARN with :* for versions
-    NagSuppressions.addResourceSuppressionsByPath(
-      this,
-      "/AtxPythonUpgradePipeline/PackageProject/Role/DefaultPolicy/Resource",
+    NagSuppressions.addResourceSuppressions(
+      packageProject,
       [
         {
           id: "AwsSolutions-IAM5",
@@ -533,31 +482,9 @@ export class AtxPipelineStack extends cdk.Stack {
             { regex: "/Resource::arn:aws:codedeploy:.*:.*:deploymentconfig:\\*/g" } as any,
           ],
         },
-      ]
+      ],
+      true
     );
-
-    // Manual approval action role: KMS actions for encrypted SNS topic
-    NagSuppressions.addResourceSuppressionsByPath(
-      this,
-      "/AtxPythonUpgradePipeline/AtxPipeline/Manual_Approve/Review_And_Approve/CodePipelineActionRole/DefaultPolicy/Resource",
-      [
-        {
-          id: "AwsSolutions-IAM5",
-          reason: "CDK generates kms:GenerateDataKey* for publishing to KMS-encrypted SNS topic.",
-          appliesTo: cdkGeneratedKmsSuppressions,
-        },
-      ]
-    );
-
-    // AwsSolutions-CB5: Custom image required for ATX transform CLI
-    NagSuppressions.addResourceSuppressions(transformProject, [
-      {
-        id: "AwsSolutions-CB5",
-        reason:
-          "ATX transform project requires the aws-transform-custom Docker image from public ECR " +
-          "which contains the ATX CLI tooling not available in standard CodeBuild images.",
-      },
-    ]);
 
     // CodeDeploy service role: CDK-managed
     NagSuppressions.addResourceSuppressions(
@@ -589,8 +516,8 @@ export class AtxPipelineStack extends cdk.Stack {
       {
         id: "AwsSolutions-L1",
         reason:
-          `Lambda starts at Python ${sourcePythonVersion} intentionally. The pipeline upgrades both the code (via ATX Transform) ` +
-          `and the runtime (via Package stage) to Python ${targetPythonVersion} as part of the CI/CD flow.`,
+          `Lambda starts at Python ${sourcePythonVersion} intentionally. CM remediates the code to Python ` +
+          `${targetPythonVersion}, and the Package stage upgrades the runtime as part of the CI/CD flow.`,
       },
     ]);
 
@@ -610,73 +537,26 @@ export class AtxPipelineStack extends cdk.Stack {
       true
     );
 
-    // BucketDeployment custom resource Lambda suppressions
-    NagSuppressions.addResourceSuppressionsByPath(
-      this,
-      "/AtxPythonUpgradePipeline/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/ServiceRole/Resource",
-      [
-        {
-          id: "AwsSolutions-IAM4",
-          reason: "CDK BucketDeployment uses AWSLambdaBasicExecutionRole. This is a CDK-managed custom resource.",
-          appliesTo: [
-            "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-          ],
-        },
-      ]
-    );
-
-    NagSuppressions.addResourceSuppressionsByPath(
-      this,
-      "/AtxPythonUpgradePipeline/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/ServiceRole/DefaultPolicy/Resource",
-      [
-        {
-          id: "AwsSolutions-IAM5",
-          reason: s3WildcardReason,
-          appliesTo: cdkGeneratedS3Suppressions,
-        },
-        {
-          id: "AwsSolutions-IAM5",
-          reason: "CDK KMS grant methods for encrypted bucket access.",
-          appliesTo: cdkGeneratedKmsSuppressions,
-        },
-        {
-          id: "AwsSolutions-IAM5",
-          reason: bucketArnWildcardReason,
-          appliesTo: ["Resource::<OutputBucket7114EB27.Arn>/*"],
-        },
-        {
-          id: "AwsSolutions-IAM5",
-          reason: "CDK BucketDeployment reads assets from the CDK bootstrap bucket.",
-          appliesTo: [
-            { regex: "/Resource::arn:<AWS::Partition>:s3:::cdk-.*-assets-.*-.*/.*/g" } as any,
-          ],
-        },
-      ]
-    );
-
-    NagSuppressions.addResourceSuppressionsByPath(
-      this,
-      "/AtxPythonUpgradePipeline/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/Resource",
-      [
-        {
-          id: "AwsSolutions-L1",
-          reason: "CDK BucketDeployment Lambda runtime is controlled by the CDK framework.",
-        },
-      ]
-    );
-
     // ─── Stack Outputs ───
-    new cdk.CfnOutput(this, "PipelineName", {
+    new cdk.CfnOutput(this, "DeployPipelineName", {
       value: pipeline.pipelineName,
-      description: "CodePipeline name",
+      description: "Deploy pipeline (runs on push/merge to the tracked branch)",
     });
-    new cdk.CfnOutput(this, "RepositoryCloneUrl", {
-      value: repo.repositoryCloneUrlHttp,
-      description: "CodeCommit repository clone URL",
+    new cdk.CfnOutput(this, "PullRequestPipelineName", {
+      value: prPipeline.pipelineName,
+      description: "CI pipeline (runs on pull requests, e.g. CM remediation PRs)",
+    });
+    new cdk.CfnOutput(this, "GitHubConnectionArn", {
+      value: connectionArn,
+      description: "CodeConnections ARN. If created by this stack, activate it once in the console.",
+    });
+    new cdk.CfnOutput(this, "GitHubRepository", {
+      value: `${githubOwner}/${githubRepo}@${githubBranch}`,
+      description: "GitHub repository and branch tracked by the pipelines",
     });
     new cdk.CfnOutput(this, "OutputBucketName", {
       value: outputBucket.bucketName,
-      description: "S3 bucket for transformation outputs",
+      description: "S3 bucket for deployed artifacts",
     });
     new cdk.CfnOutput(this, "LambdaFunctionName", {
       value: appFunction.functionName,
@@ -693,10 +573,6 @@ export class AtxPipelineStack extends cdk.Stack {
     new cdk.CfnOutput(this, "CodeDeployGroup", {
       value: deploymentGroup.deploymentGroupName,
       description: "CodeDeploy deployment group name",
-    });
-    new cdk.CfnOutput(this, "ApprovalTopicArn", {
-      value: approvalTopic.topicArn,
-      description: "SNS topic for pipeline approval notifications",
     });
   }
 }

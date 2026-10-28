@@ -2,8 +2,8 @@
   "app": "npx ts-node --project tsconfig.json bin/app.ts",
   "context": {
     "awsRegion": "us-east-1",
-    "transformationName": "python-version-upgrade-314",
+    "githubBranch": "main",
     "sourcePythonVersion": "3.9",
-    "targetPythonVersion": "3.14"
+    "targetPythonVersion": "3.13"
   }
 }
